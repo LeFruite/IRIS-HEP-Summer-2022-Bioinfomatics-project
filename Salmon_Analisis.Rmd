@@ -1,0 +1,225 @@
+---
+title: "Gene_analysis"
+author: "VShabanov"
+date: "2022-08-19"
+output: html_document
+---
+
+## Libraries
+
+```{r}
+library(tximport)
+library(dplyr)
+library(readr)
+library(DESeq2)
+library(magrittr)
+library(ggplot2)
+library(psychTools)
+library(pheatmap)
+library(genefilter)
+library(mygene)
+```
+
+## Code for Salmon
+
+Firstly we download the fasta sequence, then the gtf one. After that in a salmon environment we create the index, from which our sequenced would be analyzed. After creating an index, we execute the "salmon quant" command, which quantifies sequences in samples.
+
+```{bash}
+curl ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_35/gencode.v35.transcripts.fa.gz -o Human.fa.gz
+
+curl ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_35/gencode.v35.primary_assembly.annotation.gtf.gz -o Human.gtf.gz
+
+conda activate salmon
+
+salmon index --gencode -t Human.fa.gz -i Human_index 
+
+salmon quant -i Human_index -l A -1 SRR14598290_1.fastq  -2 SRR14598290_2.fastq -p 16 --validateMappings -o SRR14598290 -g %Use the GTF file%
+```
+
+## Preparing the script for work
+
+For this part we create a data frame which has all of the information for the analysis: it has the names of the samples, path to their quant files and whether the are from test or from control group. (Also i dint quite figured how to fix my makeshift solution (regarding tx2gene argument), so for now, sadly, tx2 stays)
+
+```{r}
+sfiles <- data.frame (
+  Sample <- c("MYO5", "MYO4", "MYO2", "MYO1", "CMV5", "CMV4", "CMV2", "CMV1"),
+  Path <- c("MYO5/quant.sf", "MYO4/quant.sf", "MYO2/quant.sf", "MYO1/quant.sf", "CMV5/quant.sf", "CMV4/quant.sf", "CMV2/quant.sf", "CMV1/quant.sf"),
+  Condition <- c("test","test","test","test","control","control","control","control")
+)
+colnames(sfiles) <- c("Sample name", "Path", "Condition")
+rownames(sfiles) <- c(1:8)
+
+
+tx2 = read_csv("Additionals/gene_map.csv", col_names = c("enstid", "ensgid"))
+
+```
+
+## Importing
+
+In this step we just import the salmon data into R.
+
+```{r}
+
+#filess argument is a modification of sfiles argument, it provides tximport with paths to the files and gives samples their name
+
+filess <- paste0(pull(sfiles, "Path"))
+names(filess) = pull(sfiles, "Sample name")
+
+
+txi.salmon <- tximport(files = filess, type = "salmon", tx2gene = tx2, ignoreTxVersion = TRUE, geneIdCol = 'Name')
+txi.salmon$counts[1:10,]
+
+```
+
+## Barplot of library sizes
+
+```{r}
+lib.size <- colSums(txi.salmon$counts)/1000000
+barplot(height=lib.size,
+        col=c("#b9e38d", "#b9e38d", "#b9e38d", "#b9e38d", "#d9b1f0","#d9b1f0","#d9b1f0","#d9b1f0"),
+        xlab = "Samples",
+        ylab = "Millions",
+        main = "Library sizes",
+        )
+abline(h = mean(lib.size),col = "Red", lty = 5, lwd = 3)
+```
+
+## Importing x2 + start of analysis
+
+After last step, we import the data into Deseq2 function, which will begin the functional analysis of the sequences First we import the data from Tximport
+
+```{r}
+
+ddsTxi <- DESeqDataSetFromTximport(txi.salmon,
+                                   colData = sfiles,
+                                   design = ~ Condition )
+
+
+```
+
+And then we start the analysis
+
+```{r}
+
+
+dds <- DESeq(ddsTxi)
+counts(dds, normalized = TRUE)[1:6,]
+keep <- rowSums(counts(dds))>=dim(dds)[2]
+dds <- dds[keep,]
+
+```
+
+## Results + the MYOC visualization
+
+In this chunk we use results function on our data and plot the MYOC gene counts in test and control groups.
+
+```{r}
+
+res <- results(dds)
+res
+
+plotCounts(dds, gene = "ENSG00000141052", intgroup="Condition")
+
+summary(res)
+
+```
+
+## MA-plot
+
+This plot provides a useful overview for the distribution of the estimated coefficients in the model across all genes
+
+```{r}
+  plotMA(res, ylim=c(-10,10))
+```
+
+## PCA plot
+
+This plot visualizes sample-to-sample distances.
+
+```{r}
+vst = varianceStabilizingTransformation(dds)
+plotPCA(vst, intgroup = "Condition")
+
+```
+
+## Sorting of the genes
+
+Here we sort the results of the gene counts and for interest we look up at which rank the MYOC gene is located.
+
+```{r}
+
+sortedres <- results(dds)
+sortedres <- sortedres[ order(sortedres$padj, decreasing = FALSE), ]
+which(rownames(sortedres) == "ENSG00000141052") 
+
+
+#write.table(sortedres,file = "DESEQ.csv", row.names = TRUE, sep = ",")
+
+```
+
+MYOC is rank number 9 in the results We have very low padj values for the first 2 genes. lets see their distribution.
+
+```{r}
+plotCounts(dds, gene = "ENSG00000125148", intgroup="Condition")
+plotCounts(dds, gene = "ENSG00000125845", intgroup="Condition")
+
+```
+
+## Heatmap
+
+For this part, we created a heat-map to better understand the analysis. This plot shows the hierarchical clustering of the top 30 genes of the MOST variable genes(between test and control groups )
+
+```{r}
+top30Genes <- head(order(rowVars(assay(vst)), decreasing = TRUE), 30)
+mat  <- assay(vst)[ top30Genes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vst)[, c("Sample name","Condition")])
+pheatmap(mat, annotation_col = anno)
+```
+
+## Pheatmap 2
+
+This plot shows the hierarchical clustering of the top 30 genes of the MOST variable genes(between test and control groups )
+
+```{r}
+resvst <- varianceStabilizingTransformation(dds)
+top30<- head(rownames(sortedres),30)
+de_mat <- assay(resvst)[top30,]
+pheatmap(de_mat, annotation_col = annot)
+```
+
+## Final Step
+
+And this is the last part of the code that is done in R. Here we create a new table, where we take gene-names and annotate them with info from the entrez system. It contains the 'gene', 'query', 'entrezgene', 'symbol', 'name', 'summary' info in it. Also from this table we take gene and log2FoldChange data that will be used in the next step of out analysis, and we download it.
+
+```{r}
+gene_names <- rownames(sortedres)
+annotAll <- queryMany(unique(gene_names),
+                      scopes='ensembl.gene',
+                      fields='entrezgene,symbol,name,summary', # pathway.kegg.id,go
+                      return.as='DataFrame',
+                      species='human',
+                      returnall=FALSE)
+
+
+write.table(gene_names,file = "DESEQnames.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+write.table(rownames(sortedres[which(sortedres$padj<0.001), ]),file = "DESEQSignnames.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# Full gene names
+gene2renamed <- data.frame(gene=rownames(sortedres), query=gene_names)
+annotAll <- merge(annotAll, gene2renamed, by='query')
+# Duplication + not found removal
+duplNoSumNoFound <- which(duplicated(annotAll$query))
+annot <- as.data.frame(annotAll[-duplNoSumNoFound,
+                                c('gene', 'query', 'entrezgene', 'symbol', 'name', 'summary')])
+rownames(annot) <- annot$gene
+
+final <- data.frame(sortedres, query=rownames(sortedres))
+final <- merge(annot, final, by='query')
+final <- subset (final, select = -query)
+
+
+dsf <- as.data.frame(final[c("gene", "log2FoldChange")])
+write.table(dsf,file = "DESEQResFinal.rnk",sep = " ", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
